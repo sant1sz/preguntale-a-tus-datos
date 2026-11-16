@@ -1,0 +1,17 @@
+### Pregunta en español
+POST http://localhost:8080/api/chat
+Content-Type: application/json
+
+{ "pregunta": "Hola, ¿qué puedes hacer por mi supermercado?" }
+
+### Question in English
+POST http://localhost:8080/api/chat
+Content-Type: application/json
+
+{ "pregunta": "Hi, what can you do for my store?" }
+
+### Pregunta vacía (debe responder 400)
+POST http://localhost:8080/api/chat
+Content-Type: application/json
+
+{ "pregunta": "" }
