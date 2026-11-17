@@ -4,14 +4,15 @@ Asistente con IA para el dueño de un supermercado: le escribes una pregunta en 
 ("¿qué productos se vendieron más esta semana?", "which items are about to expire?") y te responde
 consultando los datos del negocio.
 
-> Estado: en construcción. El chat ya responde en ambos idiomas y la base de datos simulada está lista; falta conectar el asistente a los datos.
+> Estado: en construcción. El asistente ya responde en español e inglés consultando los datos del supermercado; falta la interfaz web.
 
 ## Tecnologías
 
 - Java 21 · Spring Boot 4.1
 - Spring AI 2.0 con Google Gemini (`gemini-3.5-flash`)
 - MySQL + Spring Data JPA con un supermercado simulado
-- Próximamente: herramientas (tool calling) para que el asistente consulte los datos
+- Herramientas (tool calling) de Spring AI para que el modelo consulte la base de datos
+- Pruebas con JUnit 5 y H2 en modo MySQL
 
 ## Datos simulados
 
@@ -25,6 +26,33 @@ patrones reales para que las preguntas tengan respuestas interesantes:
 - Hay productos con stock bajo o agotados, y lotes vencidos o por vencer.
 
 La generación usa una semilla fija (`datos.semilla`), así que siempre produce los mismos datos.
+
+## Cómo responde con datos reales
+
+El modelo no ve la base de datos ni escribe SQL. En cambio tiene un conjunto de **herramientas**
+(métodos Java con `@Tool` en `HerramientasSupermercado`) y decide cuáles llamar según la pregunta.
+Spring AI ejecuta la consulta, le devuelve el resultado y el modelo lo explica en lenguaje sencillo.
+
+| Herramienta | Para qué sirve |
+|-------------|----------------|
+| `fechaActual` | Fecha de hoy y rango con ventas, para entender "ayer", "esta semana", "el mes pasado" |
+| `resumenVentas` | Total vendido, número de ventas, ticket promedio, ganancia estimada y medios de pago |
+| `ventasPorDia` / `ventasPorHora` | Tendencias, mejores días y horas pico |
+| `ventasPorCategoria` | Qué categorías venden y dejan más ganancia |
+| `rankingProductos` | Productos más o menos vendidos por unidades, ingresos o ganancia |
+| `buscarProductos` / `listarCategorias` | Precio, costo, margen y stock de cualquier producto |
+| `productosBajoStock` | Qué pedir al proveedor y para cuántos días alcanza el inventario |
+| `lotesPorVencer` | Lotes vencidos o por vencer y el costo de la mercancía en riesgo |
+
+Ejemplos de preguntas:
+
+- "¿Cuánto vendí esta semana?"
+- "¿Qué productos debo pedir al proveedor?"
+- "¿Cuáles fueron los 3 productos más vendidos el mes pasado?"
+- "Which items are about to expire?"
+
+Si la pregunta pide datos que no existen (por ejemplo, un mes sin ventas registradas), el asistente lo dice
+en lugar de inventar cifras.
 
 ## Cómo ejecutarlo
 
