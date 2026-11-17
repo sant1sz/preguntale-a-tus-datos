@@ -15,3 +15,6 @@ POST http://localhost:8080/api/chat
 Content-Type: application/json
 
 { "pregunta": "" }
+
+### Resumen de los datos simulados
+GET http://localhost:8080/api/datos/resumen
