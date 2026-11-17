@@ -37,3 +37,7 @@ application-local.properties
 
 ### Registros ###
 logs/
+
+### Notas locales ###
+CLAUDE.md
+.claude/
