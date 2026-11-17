@@ -26,6 +26,8 @@ patrones reales para que las preguntas tengan respuestas interesantes:
 - Hay productos con stock bajo o agotados, y lotes vencidos o por vencer.
 
 La generación usa una semilla fija (`datos.semilla`), así que siempre produce los mismos datos.
+Si al arrancar la última venta es de un día anterior a hoy, la aplicación borra los datos y los vuelve a simular
+con la fecha actual (`datos.regenerar-si-desactualizados`), para que "hoy" y "esta semana" siempre tengan ventas.
 
 ## Cómo responde con datos reales
 
@@ -50,6 +52,9 @@ Ejemplos de preguntas:
 - "¿Qué productos debo pedir al proveedor?"
 - "¿Cuáles fueron los 3 productos más vendidos el mes pasado?"
 - "Which items are about to expire?"
+
+Las herramientas devuelven los totales, porcentajes, promedios y extremos (mejor día, hora pico, costo total en
+riesgo) ya calculados en Java: el modelo solo los explica y no tiene que hacer cuentas, que es donde más se equivoca.
 
 Si la pregunta pide datos que no existen (por ejemplo, un mes sin ventas registradas), el asistente lo dice
 en lugar de inventar cifras.

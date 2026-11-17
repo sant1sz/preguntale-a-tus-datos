@@ -3,6 +3,7 @@ package com.sant1sz.preguntale.datos;
 import java.sql.Date;
 import java.sql.Timestamp;
 import java.time.Clock;
+import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.util.List;
 
@@ -19,7 +20,11 @@ import com.sant1sz.preguntale.datos.simulacion.CatalogoSupermercado;
 import com.sant1sz.preguntale.datos.simulacion.DatosSimulados;
 import com.sant1sz.preguntale.datos.simulacion.SimuladorSupermercado;
 
-/** Al arrancar, si la base de datos está vacía, la llena con un supermercado simulado. */
+/**
+ * Al arrancar, si la base de datos está vacía, la llena con un supermercado simulado.
+ * Si ya tiene datos pero la última venta es de un día anterior a hoy, borra todo y vuelve a simular
+ * con la fecha actual, para que "hoy" y "esta semana" siempre tengan ventas.
+ */
 @Component
 public class GeneradorDatos implements ApplicationRunner {
 
@@ -29,16 +34,19 @@ public class GeneradorDatos implements ApplicationRunner {
     private final JdbcTemplate jdbc;
     private final Clock reloj;
     private final boolean generar;
+    private final boolean regenerarSiDesactualizados;
     private final int diasHistorial;
     private final long semilla;
 
     public GeneradorDatos(JdbcTemplate jdbc, Clock reloj,
             @Value("${datos.generar}") boolean generar,
+            @Value("${datos.regenerar-si-desactualizados:true}") boolean regenerarSiDesactualizados,
             @Value("${datos.dias-historial}") int diasHistorial,
             @Value("${datos.semilla}") long semilla) {
         this.jdbc = jdbc;
         this.reloj = reloj;
         this.generar = generar;
+        this.regenerarSiDesactualizados = regenerarSiDesactualizados;
         this.diasHistorial = diasHistorial;
         this.semilla = semilla;
     }
@@ -49,19 +57,39 @@ public class GeneradorDatos implements ApplicationRunner {
         if (!generar) {
             return;
         }
+        LocalDateTime ahora = LocalDateTime.now(reloj);
         Long productos = jdbc.queryForObject("SELECT COUNT(*) FROM producto", Long.class);
         if (productos != null && productos > 0) {
-            log.info("La base ya tiene datos ({} productos); no se generan nuevos.", productos);
-            return;
+            LocalDate ultimaVenta = ultimoDiaConVentas();
+            if (!regenerarSiDesactualizados || (ultimaVenta != null && !ultimaVenta.isBefore(ahora.toLocalDate()))) {
+                log.info("La base ya tiene datos ({} productos, última venta el {}); no se generan nuevos.",
+                        productos, ultimaVenta);
+                return;
+            }
+            log.info("Los datos llegan hasta el {} y hoy es {}: se regenera el supermercado simulado.",
+                    ultimaVenta, ahora.toLocalDate());
+            borrarTodo();
         }
 
         long inicio = System.currentTimeMillis();
         DatosSimulados datos = new SimuladorSupermercado(semilla, CatalogoSupermercado.productos())
-                .simular(LocalDateTime.now(reloj), diasHistorial);
+                .simular(ahora, diasHistorial);
         guardar(datos);
         log.info("Supermercado simulado: {} productos, {} ventas, {} líneas de venta y {} lotes ({} ms).",
                 datos.productos().size(), datos.ventas().size(), datos.detalles().size(), datos.lotes().size(),
                 System.currentTimeMillis() - inicio);
+    }
+
+    private LocalDate ultimoDiaConVentas() {
+        Timestamp ultima = jdbc.queryForObject("SELECT MAX(fecha_hora) FROM venta", Timestamp.class);
+        return ultima == null ? null : ultima.toLocalDateTime().toLocalDate();
+    }
+
+    /** Borra en orden inverso a las llaves foráneas. */
+    private void borrarTodo() {
+        for (String tabla : List.of("detalle_venta", "lote", "venta", "producto", "categoria")) {
+            jdbc.update("DELETE FROM " + tabla);
+        }
     }
 
     private void guardar(DatosSimulados datos) {

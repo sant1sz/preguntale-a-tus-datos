@@ -11,8 +11,10 @@ import java.time.format.TextStyle;
 import java.time.temporal.ChronoUnit;
 import java.util.Arrays;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -23,7 +25,8 @@ import org.springframework.stereotype.Component;
 
 /**
  * Herramientas que el modelo de IA puede llamar para consultar los datos del supermercado.
- * Cada método devuelve datos reales de la base; el modelo solo los explica.
+ * Cada método devuelve datos reales de la base, con los totales, porcentajes y extremos ya calculados,
+ * para que el modelo solo tenga que explicarlos y no haga cuentas.
  * Las fechas se reciben como texto AAAA-MM-DD y los rangos incluyen ambos extremos.
  * Los montos están en pesos colombianos, sin decimales.
  */
@@ -73,22 +76,25 @@ public class HerramientasSupermercado {
 
     @Tool(description = """
             Resumen de ventas entre dos fechas: número de ventas, total vendido, ticket promedio,
-            ganancia estimada (precio de venta menos costo actual) y desglose por medio de pago.""")
+            ganancia estimada (precio de venta menos costo actual), margen y desglose por medio de pago
+            con su porcentaje del total.""")
     public ResumenVentas resumenVentas(
             @ToolParam(description = "Fecha inicial, formato AAAA-MM-DD") String desde,
             @ToolParam(description = "Fecha final (incluida), formato AAAA-MM-DD") String hasta) {
         log.info("Herramienta resumenVentas({}, {})", desde, hasta);
         Rango rango = rango(desde, hasta);
 
-        List<VentasMedioPago> porMedio = jdbc.sql("""
+        record Fila(String medio, long ventas, long total) {
+        }
+        List<Fila> filas = jdbc.sql("""
                 SELECT medio_pago, COUNT(*), COALESCE(SUM(total), 0)
                 FROM venta WHERE fecha_hora >= ? AND fecha_hora < ?
                 GROUP BY medio_pago ORDER BY 3 DESC""")
                 .params(rango.inicio(), rango.fin())
-                .query((rs, fila) -> new VentasMedioPago(rs.getString(1), rs.getLong(2), rs.getLong(3)))
+                .query((rs, fila) -> new Fila(rs.getString(1), rs.getLong(2), rs.getLong(3)))
                 .list();
-        long numeroVentas = porMedio.stream().mapToLong(VentasMedioPago::ventas).sum();
-        long total = porMedio.stream().mapToLong(VentasMedioPago::total).sum();
+        long numeroVentas = filas.stream().mapToLong(Fila::ventas).sum();
+        long total = filas.stream().mapToLong(Fila::total).sum();
         long ganancia = jdbc.sql("""
                 SELECT COALESCE(SUM(d.subtotal - d.cantidad * p.costo), 0)
                 FROM detalle_venta d
@@ -98,14 +104,19 @@ public class HerramientasSupermercado {
                 .params(rango.inicio(), rango.fin())
                 .query(Long.class).single();
 
+        List<VentasMedioPago> porMedio = filas.stream()
+                .map(f -> new VentasMedioPago(f.medio(), f.ventas(), f.total(), porcentaje(f.total(), total)))
+                .toList();
         return new ResumenVentas(rango.desde(), rango.hasta(), numeroVentas, total,
-                numeroVentas == 0 ? 0 : Math.round((double) total / numeroVentas), ganancia, porMedio);
+                numeroVentas == 0 ? 0 : Math.round((double) total / numeroVentas), ganancia,
+                porcentaje(ganancia, total), porMedio);
     }
 
     @Tool(description = """
-            Ventas de cada día entre dos fechas (máximo 120 días), con el día de la semana.
-            Sirve para ver tendencias, comparar días o encontrar el mejor y el peor día.""")
-    public List<VentasDia> ventasPorDia(
+            Ventas de cada día entre dos fechas (máximo 120 días), con el día de la semana, más el total
+            del periodo, el promedio diario y el mejor y el peor día. El día de hoy, si está en el rango,
+            va marcado como 'enCurso' y no cuenta para el promedio ni para el mejor y peor día.""")
+    public ReporteVentasDiarias ventasPorDia(
             @ToolParam(description = "Fecha inicial, formato AAAA-MM-DD") String desde,
             @ToolParam(description = "Fecha final (incluida), formato AAAA-MM-DD") String hasta) {
         log.info("Herramienta ventasPorDia({}, {})", desde, hasta);
@@ -114,44 +125,67 @@ public class HerramientasSupermercado {
             throw new IllegalArgumentException("El rango es muy largo: pide como máximo " + MAXIMO_DIAS_DETALLE
                     + " días, o usa resumenVentas para periodos largos.");
         }
-        return jdbc.sql("""
+        LocalDate hoy = LocalDate.now(reloj);
+        List<VentasDia> dias = jdbc.sql("""
                 SELECT CAST(fecha_hora AS DATE) AS dia, COUNT(*), SUM(total)
                 FROM venta WHERE fecha_hora >= ? AND fecha_hora < ?
                 GROUP BY CAST(fecha_hora AS DATE) ORDER BY dia""")
                 .params(rango.inicio(), rango.fin())
                 .query((rs, fila) -> {
                     LocalDate dia = rs.getDate(1).toLocalDate();
-                    return new VentasDia(dia, nombreDia(dia), rs.getLong(2), rs.getLong(3));
+                    return new VentasDia(dia, nombreDia(dia), rs.getLong(2), rs.getLong(3), dia.equals(hoy));
                 })
                 .list();
+
+        List<VentasDia> completos = dias.stream().filter(d -> !d.enCurso()).toList();
+        long promedio = Math.round(completos.stream().mapToLong(VentasDia::total).average().orElse(0));
+        return new ReporteVentasDiarias(rango.desde(), rango.hasta(),
+                dias.stream().mapToLong(VentasDia::ventas).sum(),
+                dias.stream().mapToLong(VentasDia::total).sum(),
+                dias.size(), promedio,
+                completos.stream().max(Comparator.comparingLong(VentasDia::total)).orElse(null),
+                completos.stream().min(Comparator.comparingLong(VentasDia::total)).orElse(null),
+                dias);
     }
 
     @Tool(description = """
-            Ventas agrupadas por hora del día (0 a 23) entre dos fechas.
-            Sirve para saber cuáles son las horas pico y las horas flojas.""")
-    public List<VentasHora> ventasPorHora(
+            Ventas agrupadas por hora del día (0 a 23) entre dos fechas, con el porcentaje de cada hora,
+            la hora pico y la hora más floja. Sirve para saber cuándo hay más clientes.""")
+    public ReporteVentasPorHora ventasPorHora(
             @ToolParam(description = "Fecha inicial, formato AAAA-MM-DD") String desde,
             @ToolParam(description = "Fecha final (incluida), formato AAAA-MM-DD") String hasta) {
         log.info("Herramienta ventasPorHora({}, {})", desde, hasta);
         Rango rango = rango(desde, hasta);
-        return jdbc.sql("""
+        record Fila(int hora, long ventas, long total) {
+        }
+        List<Fila> filas = jdbc.sql("""
                 SELECT EXTRACT(HOUR FROM fecha_hora) AS hora, COUNT(*), SUM(total)
                 FROM venta WHERE fecha_hora >= ? AND fecha_hora < ?
                 GROUP BY EXTRACT(HOUR FROM fecha_hora) ORDER BY hora""")
                 .params(rango.inicio(), rango.fin())
-                .query((rs, fila) -> new VentasHora(rs.getInt(1), rs.getLong(2), rs.getLong(3)))
+                .query((rs, fila) -> new Fila(rs.getInt(1), rs.getLong(2), rs.getLong(3)))
                 .list();
+        long total = filas.stream().mapToLong(Fila::total).sum();
+        List<VentasHora> horas = filas.stream()
+                .map(f -> new VentasHora(f.hora(), f.ventas(), f.total(), porcentaje(f.total(), total)))
+                .toList();
+        return new ReporteVentasPorHora(rango.desde(), rango.hasta(), total,
+                horas.stream().max(Comparator.comparingLong(VentasHora::total)).orElse(null),
+                horas.stream().min(Comparator.comparingLong(VentasHora::total)).orElse(null),
+                horas);
     }
 
     @Tool(description = """
-            Ventas por categoría entre dos fechas: unidades, total vendido y ganancia estimada,
-            ordenadas de mayor a menor total vendido.""")
-    public List<VentasCategoria> ventasPorCategoria(
+            Ventas por categoría entre dos fechas: unidades, total vendido, ganancia estimada y porcentaje
+            de las ventas del periodo, ordenadas de mayor a menor, más los totales del periodo.""")
+    public ReporteCategorias ventasPorCategoria(
             @ToolParam(description = "Fecha inicial, formato AAAA-MM-DD") String desde,
             @ToolParam(description = "Fecha final (incluida), formato AAAA-MM-DD") String hasta) {
         log.info("Herramienta ventasPorCategoria({}, {})", desde, hasta);
         Rango rango = rango(desde, hasta);
-        return jdbc.sql("""
+        record Fila(String categoria, long unidades, long total, long ganancia) {
+        }
+        List<Fila> filas = jdbc.sql("""
                 SELECT c.nombre, SUM(d.cantidad), SUM(d.subtotal), SUM(d.subtotal - d.cantidad * p.costo)
                 FROM detalle_venta d
                 JOIN venta v ON v.id = d.venta_id
@@ -160,15 +194,20 @@ public class HerramientasSupermercado {
                 WHERE v.fecha_hora >= ? AND v.fecha_hora < ?
                 GROUP BY c.nombre ORDER BY 3 DESC""")
                 .params(rango.inicio(), rango.fin())
-                .query((rs, fila) -> new VentasCategoria(rs.getString(1), rs.getLong(2), rs.getLong(3), rs.getLong(4)))
+                .query((rs, fila) -> new Fila(rs.getString(1), rs.getLong(2), rs.getLong(3), rs.getLong(4)))
                 .list();
+        long total = filas.stream().mapToLong(Fila::total).sum();
+        return new ReporteCategorias(rango.desde(), rango.hasta(), total,
+                filas.stream().mapToLong(Fila::ganancia).sum(),
+                filas.stream().map(f -> new VentasCategoria(f.categoria(), f.unidades(), f.total(), f.ganancia(),
+                        porcentaje(f.total(), total))).toList());
     }
 
     @Tool(description = """
             Ranking de productos entre dos fechas: los más vendidos o los menos vendidos
             (incluye productos que no se vendieron nada), por unidades, total vendido o ganancia.
-            Se puede filtrar por categoría.""")
-    public List<VentasProducto> rankingProductos(
+            Cada producto trae su porcentaje de las ventas del periodo. Se puede filtrar por categoría.""")
+    public RankingProductos rankingProductos(
             @ToolParam(description = "Fecha inicial, formato AAAA-MM-DD") String desde,
             @ToolParam(description = "Fecha final (incluida), formato AAAA-MM-DD") String hasta,
             @ToolParam(description = "Cómo ordenar: UNIDADES, INGRESOS o GANANCIA") CriterioRanking criterio,
@@ -178,6 +217,7 @@ public class HerramientasSupermercado {
         log.info("Herramienta rankingProductos({}, {}, {}, {}, {}, {})", desde, hasta, criterio, orden, categoria, limite);
         Rango rango = rango(desde, hasta);
         CriterioRanking porCriterio = criterio == null ? CriterioRanking.UNIDADES : criterio;
+        OrdenRanking enOrden = orden == null ? OrdenRanking.MAS_VENDIDOS : orden;
         int cuantos = limite == null ? 10 : Math.clamp(limite, 1, 40);
         String filtroCategoria = categoria == null || categoria.isBlank() ? null : categoria.strip();
         if (filtroCategoria != null && !existeCategoria(filtroCategoria)) {
@@ -185,7 +225,9 @@ public class HerramientasSupermercado {
                     + "'. Usa listarCategorias para ver los nombres exactos.");
         }
 
-        List<VentasProducto> productos = jdbc.sql("""
+        record Fila(String producto, String categoria, long unidades, long total, long ganancia) {
+        }
+        List<Fila> todos = jdbc.sql("""
                 SELECT p.nombre, c.nombre, COALESCE(s.unidades, 0), COALESCE(s.total, 0),
                        COALESCE(s.total, 0) - COALESCE(s.unidades, 0) * p.costo
                 FROM producto p
@@ -197,25 +239,28 @@ public class HerramientasSupermercado {
                     GROUP BY d.producto_id
                 ) s ON s.producto_id = p.id""")
                 .params(rango.inicio(), rango.fin())
-                .query((rs, fila) -> new VentasProducto(rs.getString(1), rs.getString(2),
+                .query((rs, fila) -> new Fila(rs.getString(1), rs.getString(2),
                         rs.getLong(3), rs.getLong(4), rs.getLong(5)))
-                .list()
-                .stream()
-                .filter(p -> filtroCategoria == null || p.categoria().equals(filtroCategoria))
-                .toList();
+                .list();
+        long totalPeriodo = todos.stream().mapToLong(Fila::total).sum();
 
         Comparator<VentasProducto> comparador = Comparator.comparingLong(switch (porCriterio) {
             case UNIDADES -> VentasProducto::unidades;
             case INGRESOS -> VentasProducto::totalVendido;
             case GANANCIA -> VentasProducto::gananciaEstimada;
         });
-        if (orden != OrdenRanking.MENOS_VENDIDOS) {
+        if (enOrden == OrdenRanking.MAS_VENDIDOS) {
             comparador = comparador.reversed();
         }
-        return productos.stream()
+        List<VentasProducto> productos = todos.stream()
+                .filter(f -> filtroCategoria == null || f.categoria().equals(filtroCategoria))
+                .map(f -> new VentasProducto(f.producto(), f.categoria(), f.unidades(), f.total(), f.ganancia(),
+                        porcentaje(f.total(), totalPeriodo)))
                 .sorted(comparador.thenComparing(VentasProducto::producto))
                 .limit(cuantos)
                 .toList();
+        return new RankingProductos(rango.desde(), rango.hasta(), porCriterio, enOrden, filtroCategoria,
+                totalPeriodo, productos);
     }
 
     // ---------- Productos e inventario ----------
@@ -238,11 +283,13 @@ public class HerramientasSupermercado {
 
     @Tool(description = """
             Productos con stock por debajo del mínimo (incluye agotados), con su venta diaria promedio
-            de los últimos 28 días y para cuántos días alcanza el stock. Sirve para saber qué pedir al proveedor.""")
-    public List<AlertaStock> productosBajoStock() {
+            de los últimos 28 días, para cuántos días alcanza el stock y cuántas unidades faltan para
+            llegar al mínimo. Trae también cuántos productos hay en alerta y cuántos están agotados.
+            Sirve para saber qué pedir al proveedor.""")
+    public ReporteStock productosBajoStock() {
         log.info("Herramienta productosBajoStock");
         LocalDate hoy = LocalDate.now(reloj);
-        return jdbc.sql("""
+        List<AlertaStock> productos = jdbc.sql("""
                 SELECT p.nombre, c.nombre, p.stock_actual, p.stock_minimo, COALESCE(s.unidades, 0)
                 FROM producto p
                 JOIN categoria c ON c.id = p.categoria_id
@@ -258,23 +305,27 @@ public class HerramientasSupermercado {
                         Timestamp.valueOf(hoy.atStartOfDay()))
                 .query((rs, fila) -> {
                     int stock = rs.getInt(3);
+                    int minimo = rs.getInt(4);
                     double promedioDiario = redondear(rs.getLong(5) / (double) DIAS_PROMEDIO_VENTAS);
                     Double diasParaAgotarse = promedioDiario == 0 ? null : redondear(stock / promedioDiario);
-                    return new AlertaStock(rs.getString(1), rs.getString(2), stock, rs.getInt(4),
+                    return new AlertaStock(rs.getString(1), rs.getString(2), stock, minimo, minimo - stock,
                             stock == 0, promedioDiario, diasParaAgotarse);
                 })
                 .list();
+        return new ReporteStock(productos.size(), productos.stream().filter(AlertaStock::agotado).count(),
+                productos.stream().mapToInt(AlertaStock::faltanParaElMinimo).sum(), productos);
     }
 
     @Tool(description = """
-            Lotes ya vencidos y lotes que vencen en los próximos días, con unidades,
-            días restantes (negativo = ya vencido) y el costo de la mercancía en riesgo.""")
-    public List<LoteVencimiento> lotesPorVencer(
+            Lotes ya vencidos y lotes que vencen en los próximos días, con unidades, días restantes
+            (negativo = ya vencido) y el costo de la mercancía en riesgo. Trae los totales ya sumados
+            (unidades y costo en riesgo, aparte lo ya vencido) y el resumen por producto.""")
+    public ReporteVencimientos lotesPorVencer(
             @ToolParam(required = false, description = "Cuántos días hacia adelante revisar, de 0 a 60 (por defecto 7)") Integer dias) {
         log.info("Herramienta lotesPorVencer({})", dias);
         LocalDate hoy = LocalDate.now(reloj);
         int horizonte = dias == null ? 7 : Math.clamp(dias, 0, 60);
-        return jdbc.sql("""
+        List<LoteVencimiento> lotes = jdbc.sql("""
                 SELECT p.nombre, l.codigo, l.cantidad, l.fecha_vencimiento, l.cantidad * p.costo
                 FROM lote l JOIN producto p ON p.id = l.producto_id
                 WHERE l.cantidad > 0 AND l.fecha_vencimiento <= ?
@@ -287,6 +338,24 @@ public class HerramientasSupermercado {
                             diasRestantes, diasRestantes < 0, rs.getLong(5));
                 })
                 .list();
+
+        Map<String, ProductoEnRiesgo> porProducto = new LinkedHashMap<>();
+        for (LoteVencimiento lote : lotes) {
+            porProducto.merge(lote.producto(),
+                    new ProductoEnRiesgo(lote.producto(), 1, lote.unidades(), lote.costoEnRiesgo(), lote.fechaVencimiento()),
+                    (a, b) -> new ProductoEnRiesgo(a.producto(), a.lotes() + 1, a.unidades() + b.unidades(),
+                            a.costoEnRiesgo() + b.costoEnRiesgo(), a.primerVencimiento()));
+        }
+        List<LoteVencimiento> vencidos = lotes.stream().filter(LoteVencimiento::vencido).toList();
+        return new ReporteVencimientos(hoy, horizonte, lotes.size(),
+                lotes.stream().mapToLong(LoteVencimiento::unidades).sum(),
+                lotes.stream().mapToLong(LoteVencimiento::costoEnRiesgo).sum(),
+                vencidos.size(),
+                vencidos.stream().mapToLong(LoteVencimiento::costoEnRiesgo).sum(),
+                porProducto.values().stream()
+                        .sorted(Comparator.comparingLong(ProductoEnRiesgo::costoEnRiesgo).reversed())
+                        .toList(),
+                lotes);
     }
 
     // ---------- Apoyo ----------
@@ -299,9 +368,8 @@ public class HerramientasSupermercado {
                 .query((rs, fila) -> {
                     long precio = rs.getLong(3);
                     long costo = rs.getLong(4);
-                    double margen = precio == 0 ? 0 : redondear(100.0 * (precio - costo) / precio);
-                    return new InfoProducto(rs.getString(1), rs.getString(2), precio, costo, margen,
-                            rs.getInt(5), rs.getInt(6), rs.getBoolean(7));
+                    return new InfoProducto(rs.getString(1), rs.getString(2), precio, costo,
+                            porcentaje(precio - costo, precio), rs.getInt(5), rs.getInt(6), rs.getBoolean(7));
                 })
                 .list();
     }
@@ -345,6 +413,11 @@ public class HerramientasSupermercado {
                 .strip();
     }
 
+    /** Porcentaje con un decimal; 0 si el total es 0. */
+    private static double porcentaje(long parte, long total) {
+        return total == 0 ? 0 : redondear(100.0 * parte / total);
+    }
+
     private static double redondear(double valor) {
         return Math.round(valor * 10) / 10.0;
     }
@@ -369,31 +442,62 @@ public class HerramientasSupermercado {
     }
 
     public record ResumenVentas(LocalDate desde, LocalDate hasta, long numeroVentas, long totalVendido,
-            long ticketPromedio, long gananciaEstimada, List<VentasMedioPago> porMedioPago) {
+            long ticketPromedio, long gananciaEstimada, double margenPorcentaje, List<VentasMedioPago> porMedioPago) {
     }
 
-    public record VentasMedioPago(String medioPago, long ventas, long total) {
+    public record VentasMedioPago(String medioPago, long ventas, long total, double porcentajeDelTotal) {
     }
 
-    public record VentasDia(LocalDate fecha, String diaSemana, long ventas, long total) {
+    public record ReporteVentasDiarias(LocalDate desde, LocalDate hasta, long numeroVentas, long totalVendido,
+            int diasConVentas, long promedioDiarioDiasCompletos, VentasDia mejorDia, VentasDia peorDia,
+            List<VentasDia> dias) {
     }
 
-    public record VentasHora(int hora, long ventas, long total) {
+    public record VentasDia(LocalDate fecha, String diaSemana, long ventas, long total, boolean enCurso) {
     }
 
-    public record VentasCategoria(String categoria, long unidades, long totalVendido, long gananciaEstimada) {
+    public record ReporteVentasPorHora(LocalDate desde, LocalDate hasta, long totalVendido,
+            VentasHora horaPico, VentasHora horaMasFloja, List<VentasHora> horas) {
+    }
+
+    public record VentasHora(int hora, long ventas, long total, double porcentajeDelTotal) {
+    }
+
+    public record ReporteCategorias(LocalDate desde, LocalDate hasta, long totalVendido, long gananciaEstimada,
+            List<VentasCategoria> categorias) {
+    }
+
+    public record VentasCategoria(String categoria, long unidades, long totalVendido, long gananciaEstimada,
+            double porcentajeDelTotal) {
+    }
+
+    public record RankingProductos(LocalDate desde, LocalDate hasta, CriterioRanking criterio, OrdenRanking orden,
+            String categoria, long totalVendidoPeriodo, List<VentasProducto> productos) {
     }
 
     public record VentasProducto(String producto, String categoria, long unidades, long totalVendido,
-            long gananciaEstimada) {
+            long gananciaEstimada, double porcentajeDelTotal) {
     }
 
     public record InfoProducto(String nombre, String categoria, long precio, long costo, double margenPorcentaje,
             int stockActual, int stockMinimo, boolean perecedero) {
     }
 
-    public record AlertaStock(String producto, String categoria, int stockActual, int stockMinimo, boolean agotado,
-            double ventaDiariaPromedio, Double diasParaAgotarse) {
+    public record ReporteStock(int productosEnAlerta, long productosAgotados, int unidadesFaltantesParaElMinimo,
+            List<AlertaStock> productos) {
+    }
+
+    public record AlertaStock(String producto, String categoria, int stockActual, int stockMinimo,
+            int faltanParaElMinimo, boolean agotado, double ventaDiariaPromedio, Double diasParaAgotarse) {
+    }
+
+    public record ReporteVencimientos(LocalDate hoy, int diasRevisados, int totalLotes, long totalUnidades,
+            long costoTotalEnRiesgo, int lotesVencidos, long costoYaVencido, List<ProductoEnRiesgo> porProducto,
+            List<LoteVencimiento> lotes) {
+    }
+
+    public record ProductoEnRiesgo(String producto, int lotes, long unidades, long costoEnRiesgo,
+            LocalDate primerVencimiento) {
     }
 
     public record LoteVencimiento(String producto, String codigoLote, int unidades, LocalDate fechaVencimiento,
