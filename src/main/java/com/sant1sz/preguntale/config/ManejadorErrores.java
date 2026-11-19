@@ -5,7 +5,9 @@ import java.util.Map;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
+import org.springframework.web.ErrorResponse;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
@@ -26,6 +28,12 @@ public class ManejadorErrores {
 
     @ExceptionHandler(Exception.class)
     public ResponseEntity<Map<String, String>> errorInesperado(Exception ex) {
+        // Errores de Spring que ya traen su código (ruta inexistente, método no permitido...): se respetan
+        if (ex instanceof ErrorResponse respuesta) {
+            HttpStatusCode codigo = respuesta.getStatusCode();
+            String mensaje = codigo.value() == 404 ? "No existe esa ruta" : "Solicitud no válida";
+            return ResponseEntity.status(codigo).body(Map.of("error", mensaje));
+        }
         log.error("Error al responder la pregunta", ex);
         return ResponseEntity.status(HttpStatus.BAD_GATEWAY)
                 .body(Map.of("error", "No pude obtener respuesta del modelo de IA. Revisa la clave de Gemini y la conexión."));

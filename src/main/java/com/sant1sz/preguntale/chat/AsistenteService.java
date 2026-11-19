@@ -1,6 +1,8 @@
 package com.sant1sz.preguntale.chat;
 
 import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.ai.chat.client.advisor.MessageChatMemoryAdvisor;
+import org.springframework.ai.chat.memory.ChatMemory;
 import org.springframework.stereotype.Service;
 
 import com.sant1sz.preguntale.herramientas.HerramientasSupermercado;
@@ -26,18 +28,41 @@ public class AsistenteService {
             - Cuando ayude, termina con una recomendación corta y práctica (qué pedir, qué promocionar).
             """;
 
-    private final ChatClient chatClient;
+    static final String INSTRUCCIONES_WHATSAPP = """
 
-    public AsistenteService(ChatClient.Builder builder, HerramientasSupermercado herramientas) {
+            Estás respondiendo por WhatsApp, en una conversación que continúa: puedes apoyarte en
+            los mensajes anteriores ("¿y ayer?", "¿y de esos cuál deja más ganancia?").
+            - Mensajes cortos, fáciles de leer en el celular.
+            - Para resaltar usa *un solo asterisco*. No uses títulos con #, ni tablas, ni líneas ---.
+            - Para listas usa guiones o números.
+            """;
+
+    private final ChatClient chatClient;
+    private final MessageChatMemoryAdvisor memoria;
+
+    public AsistenteService(ChatClient.Builder builder, HerramientasSupermercado herramientas, ChatMemory memoria) {
         this.chatClient = builder
                 .defaultSystem(INSTRUCCIONES)
                 .defaultTools(herramientas)
                 .build();
+        this.memoria = MessageChatMemoryAdvisor.builder(memoria).build();
     }
 
+    /** Pregunta suelta, sin memoria (la usa la API REST /api/chat). */
     public String responder(String pregunta) {
         return chatClient.prompt()
                 .user(pregunta)
+                .call()
+                .content();
+    }
+
+    /** Pregunta dentro de la conversación de WhatsApp de ese número: recuerda los últimos mensajes. */
+    public String responderPorWhatsApp(String pregunta, String telefono) {
+        return chatClient.prompt()
+                .system(INSTRUCCIONES + INSTRUCCIONES_WHATSAPP)
+                .user(pregunta)
+                .advisors(memoria)
+                .advisors(a -> a.param(ChatMemory.CONVERSATION_ID, "whatsapp:" + telefono))
                 .call()
                 .content();
     }
