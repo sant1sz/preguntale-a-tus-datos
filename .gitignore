@@ -41,3 +41,6 @@ logs/
 ### Notas locales ###
 CLAUDE.md
 .claude/
+
+### Programas locales (no se suben) ###
+.herramientas/
